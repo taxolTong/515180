@@ -1,0 +1,22 @@
+[
+  {
+    "account": "weighted",
+    "trades": 140,
+    "tCount": 68,
+    "tWinRate": "54.4%",
+    "tProfit": "918.00",
+    "startEquity": 22290,
+    "endEquity": 25642.1,
+    "returnPct": "15.04%"
+  },
+  {
+    "account": "unweighted",
+    "trades": 182,
+    "tCount": 90,
+    "tWinRate": "55.6%",
+    "tProfit": "1431.00",
+    "startEquity": 22290,
+    "endEquity": 25108.57,
+    "returnPct": "12.64%"
+  }
+]
