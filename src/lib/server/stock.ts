@@ -1,8 +1,22 @@
-import type { HistoryPoint, HistoryResponse, Quote } from '$lib/types';
+import type { HistoryPoint, HistoryResponse, Quote, TSignal } from '$lib/types';
 import { round } from '$lib/model';
 
 const START_DATE = '2024-09-01';
 const HISTORY_TTL = 60 * 60 * 1000; // 1h
+
+// 近期走势加权（问题三）：半衰期 26 周，越近的数据权重越大，
+// 让 924 牛市等早期行情对趋势与通道的影响随时间衰减。
+const HALF_LIFE_WEEKS = 26;
+
+// 动态做T阈值（问题二）：以近 20 个交易日的日内中位振幅为基准，
+// 正常区阈值 = 振幅 × 0.45（下限 0.50%，上限 1.00%），高/低估区为其 0.8 倍（下限 0.40%，上限 0.80%）。
+const AMP_WINDOW = 20;
+const NORMAL_K = 0.45;
+const NORMAL_MIN = 0.005;
+const NORMAL_MAX = 0.01;
+const ZONE_RATIO = 0.8;
+const ZONE_MIN = 0.004;
+const ZONE_MAX = 0.008;
 
 let historyCache: { at: number; data: HistoryResponse } | null = null;
 
@@ -18,8 +32,45 @@ function quantile(sorted: number[], p: number): number {
 	return lo + rest * (hi - lo);
 }
 
+/** 加权分位数：按权重累积到 p 处取残差值 */
+function weightedQuantile(values: number[], weights: number[], p: number): number {
+	const order = values.map((v, i) => [v, weights[i]] as const).sort((a, b) => a[0] - b[0]);
+	const total = weights.reduce((a, b) => a + b, 0);
+	let acc = 0;
+	for (const [v, w] of order) {
+		acc += w;
+		if (acc / total >= p) return v;
+	}
+	return order[order.length - 1][0];
+}
+
+function clamp(x: number, lo: number, hi: number): number {
+	return Math.min(hi, Math.max(lo, x));
+}
+
 function daysBetween(a: string, b: string): number {
 	return (new Date(b + 'T00:00:00Z').getTime() - new Date(a + 'T00:00:00Z').getTime()) / 86400000;
+}
+
+async function fetchDailyAmplitude(): Promise<number> {
+	const url = 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh515180,day,,,320,qfq';
+	const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+	if (!res.ok) throw new Error(`日K请求失败: ${res.status}`);
+	const data = (await res.json()) as {
+		data?: { sh515180?: { qfqday?: string[][]; day?: string[][] } };
+	};
+	const rows = data.data?.sh515180?.qfqday ?? data.data?.sh515180?.day ?? [];
+	if (!rows.length) throw new Error('日K无数据');
+	const amps = rows
+		.map((r) => {
+			const open = parseFloat(r[1]);
+			return open > 0 ? (parseFloat(r[3]) - parseFloat(r[4])) / open : 0;
+		})
+		.filter((a) => a > 0)
+		.slice(-AMP_WINDOW);
+	if (!amps.length) throw new Error('日K振幅数据不足');
+	amps.sort((a, b) => a - b);
+	return amps[Math.floor(amps.length / 2)]; // 中位数
 }
 
 async function fetchHistory(): Promise<HistoryResponse> {
@@ -29,7 +80,12 @@ async function fetchHistory(): Promise<HistoryResponse> {
 	const data = (await res.json()) as {
 		data?: { sh515180?: { qfqweek?: string[][]; week?: string[][] } };
 	};
-	const rows = data.data?.sh515180?.qfqweek ?? data.data?.sh515180?.week ?? [];
+	const node = data.data?.sh515180;
+	// 问题一：历史建模统一使用前复权(qfq)周K。腾讯前复权以最新价为锚、
+	// 除息日下调历史价，分红造成的跳空在序列内部已被抹平，与实时价可比。
+	// 若接口未返回 qfqweek 而回退到未复权数据，必须亮出标志，避免分红后模型失真。
+	const adjusted = !!node?.qfqweek && node.qfqweek.length > 0;
+	const rows = node?.qfqweek ?? node?.week ?? [];
 	if (!rows.length) throw new Error('历史行情无数据');
 
 	// 腾讯周K格式: [日期, 开盘, 收盘, 最高, 最低, 成交量]
@@ -44,44 +100,84 @@ async function fetchHistory(): Promise<HistoryResponse> {
 	const ys = points.map((p) => p.price);
 	const n = points.length;
 
-	const meanX = xs.reduce((a, b) => a + b, 0) / n;
-	const meanY = ys.reduce((a, b) => a + b, 0) / n;
-	let num = 0;
-	let den = 0;
-	for (let i = 0; i < n; i++) {
-		num += (xs[i] - meanX) * (ys[i] - meanY);
-		den += (xs[i] - meanX) ** 2;
-	}
-	const slope = den === 0 ? 0 : num / den;
-	const intercept = meanY - slope * meanX;
-
-	const residuals = points.map((p, i) => p.price - (intercept + slope * xs[i]));
-	const sorted = [...residuals].sort((a, b) => a - b);
-	const bands = {
-		high95: round(quantile(sorted, 0.95)),
-		low05: round(quantile(sorted, 0.05)),
-		high99: round(quantile(sorted, 0.99)),
-		low01: round(quantile(sorted, 0.01))
+	// 双模型拟合（问题三）：同一批数据同时给出「近期加权」与「等权全样本」两套趋势线与通道，
+	// 前端可切换查看；两套模型区域判断一致时信号可信度更高。
+	const fit = (ws: number[], weighted: boolean) => {
+		const W = ws.reduce((a, b) => a + b, 0);
+		const meanX = ws.reduce((a, w, i) => a + w * xs[i], 0) / W;
+		const meanY = ws.reduce((a, w, i) => a + w * ys[i], 0) / W;
+		let num = 0;
+		let den = 0;
+		for (let i = 0; i < n; i++) {
+			num += ws[i] * (xs[i] - meanX) * (ys[i] - meanY);
+			den += ws[i] * (xs[i] - meanX) ** 2;
+		}
+		const slope = den === 0 ? 0 : num / den;
+		const intercept = meanY - slope * meanX;
+		const residuals = points.map((p, i) => p.price - (intercept + slope * xs[i]));
+		const bands = weighted
+			? {
+					high95: round(weightedQuantile(residuals, ws, 0.95)),
+					low05: round(weightedQuantile(residuals, ws, 0.05)),
+					high99: round(weightedQuantile(residuals, ws, 0.99)),
+					low01: round(weightedQuantile(residuals, ws, 0.01))
+				}
+			: {
+					high95: round(
+						quantile(
+							[...residuals].sort((a, b) => a - b),
+							0.95
+						)
+					),
+					low05: round(
+						quantile(
+							[...residuals].sort((a, b) => a - b),
+							0.05
+						)
+					),
+					high99: round(
+						quantile(
+							[...residuals].sort((a, b) => a - b),
+							0.99
+						)
+					),
+					low01: round(
+						quantile(
+							[...residuals].sort((a, b) => a - b),
+							0.01
+						)
+					)
+				};
+		return { intercept: round(intercept), slope: round(slope, 6), bands };
 	};
 
-	const history: HistoryPoint[] = points.map((p, i) => {
-		const trend = intercept + slope * xs[i];
-		return {
-			date: p.date,
-			price: p.price,
-			trend: round(trend),
-			high95: round(trend + bands.high95),
-			low05: round(trend + bands.low05),
-			high99: round(trend + bands.high99),
-			low01: round(trend + bands.low01)
-		};
-	});
+	const weights = xs.map((x) => 0.5 ** ((xs[n - 1] - x) / 7 / HALF_LIFE_WEEKS));
+	const weighted = fit(weights, true);
+	const unweighted = fit(new Array(n).fill(1), false);
+	const W = weights.reduce((a, b) => a + b, 0);
+	const effectiveN = round((W * W) / weights.reduce((a, w) => a + w * w, 0), 1);
+
+	// 动态做T阈值（问题二）
+	const medianAmp = await fetchDailyAmplitude();
+	const normal = clamp(medianAmp * NORMAL_K, NORMAL_MIN, NORMAL_MAX);
+	const zone = clamp(normal * ZONE_RATIO, ZONE_MIN, ZONE_MAX);
+	const tSignal: TSignal = {
+		normal: round(normal, 4),
+		zone: round(zone, 4),
+		medianAmp: round(medianAmp, 4),
+		windowDays: AMP_WINDOW
+	};
+
+	const history: HistoryPoint[] = points.map((p) => ({ date: p.date, price: p.price }));
 
 	return {
 		baseDate,
-		intercept: round(intercept),
-		slope: round(slope, 6),
-		bands,
+		weighted,
+		unweighted,
+		adjusted,
+		halfLifeWeeks: HALF_LIFE_WEEKS,
+		effectiveN,
+		tSignal,
 		history
 	};
 }

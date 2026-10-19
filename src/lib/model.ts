@@ -1,4 +1,4 @@
-import type { Model } from './types';
+import type { Bands, ModelFit } from './types';
 
 export type Zone = 'extreme_low' | 'low' | 'normal' | 'high' | 'extreme_high';
 
@@ -32,19 +32,20 @@ export function addDays(dateStr: string, days: number): string {
 	return d.toISOString().slice(0, 10);
 }
 
-export function trendValue(model: Model, days: number): number {
-	return model.intercept + model.slope * days;
+export function trendValue(fit: ModelFit, days: number): number {
+	return fit.intercept + fit.slope * days;
 }
 
-export function calcBands(model: Model, dateStr: string): BandsOfToday {
-	const days = daysFromBase(dateStr, model.baseDate);
-	const trend = trendValue(model, days);
+export function calcBands(fit: ModelFit, baseDate: string, dateStr: string): BandsOfToday {
+	const days = daysFromBase(dateStr, baseDate);
+	const trend = trendValue(fit, days);
+	const b: Bands = fit.bands;
 	return {
 		trend,
-		high95: trend + model.bands.high95,
-		low05: trend + model.bands.low05,
-		high99: trend + model.bands.high99,
-		low01: trend + model.bands.low01,
+		high95: trend + b.high95,
+		low05: trend + b.low05,
+		high99: trend + b.high99,
+		low01: trend + b.low01,
 		days
 	};
 }

@@ -29,7 +29,9 @@
 		type BandsOfToday,
 		type Zone
 	} from '$lib/model';
-	import type { HistoryPoint, HistoryResponse, Model, Quote } from '$lib/types';
+	import type { HistoryPoint, HistoryResponse, Model, Quote, TSignal } from '$lib/types';
+
+	const pct = (x: number) => (x * 100).toFixed(2) + '%';
 
 	let history = $state<HistoryPoint[]>([]);
 	let model = $state<Model | null>(null);
@@ -40,12 +42,25 @@
 	let manualPrice = $state('');
 	let chartCanvas = $state<HTMLCanvasElement | null>(null);
 	let chart: Chart | null = null;
+	let useWeighted = $state(true); // 问题三开关：true=近期加权，false=等权全样本
 
 	const today = new Date().toISOString().slice(0, 10);
 
 	const effective = $derived(manual ?? quote);
-	const bands: BandsOfToday | null = $derived(model && effective ? calcBands(model, today) : null);
+	const activeFit = $derived(model ? (useWeighted ? model.weighted : model.unweighted) : null);
+	const altFit = $derived(model ? (useWeighted ? model.unweighted : model.weighted) : null);
+	const bands: BandsOfToday | null = $derived(
+		model && activeFit && effective ? calcBands(activeFit, model.baseDate, today) : null
+	);
+	const altBands: BandsOfToday | null = $derived(
+		model && altFit && effective ? calcBands(altFit, model.baseDate, today) : null
+	);
 	const zone: Zone | null = $derived(bands && effective ? getZone(effective.price, bands) : null);
+	const altZone: Zone | null = $derived(
+		altBands && effective ? getZone(effective.price, altBands) : null
+	);
+	// 双模型一致性：区域判断相同 → 信号可信度高；分歧 → 谨慎参考
+	const agree: boolean | null = $derived(zone && altZone ? zone === altZone : null);
 	const deviationPct = $derived(bands ? ((effective!.price - bands.trend) / bands.trend) * 100 : 0);
 
 	const priceClass = $derived(
@@ -66,7 +81,7 @@
 			tagClass: string;
 			color: string;
 			title: string;
-			body: string;
+			body: (t: TSignal) => string;
 			icon: typeof Flame;
 		}
 	> = {
@@ -75,7 +90,8 @@
 			tagClass: 'tag-buy',
 			color: '#22c55e',
 			title: '极端低估',
-			body: '当前价格远低于历史1%分位，是极限抄底机会，可大幅加仓。日内跌0.40%即加仓，收盘前保持仓位。',
+			body: (t) =>
+				`当前价格远低于历史1%分位，是极限抄底机会，可大幅加仓。日内跌${pct(t.zone)}即加仓，收盘前保持仓位。`,
 			icon: Flame
 		},
 		low: {
@@ -83,7 +99,8 @@
 			tagClass: 'tag-buy',
 			color: '#4ade80',
 			title: '低估区',
-			body: '价格低于95%历史交易日，任何回调都是加仓机会。日内相对开盘跌≥0.40%即加仓，不T出。',
+			body: (t) =>
+				`价格低于95%历史交易日，任何回调都是加仓机会。日内相对开盘跌≥${pct(t.zone)}即加仓，不T出。`,
 			icon: CircleCheck
 		},
 		normal: {
@@ -91,7 +108,8 @@
 			tagClass: 'tag-neutral',
 			color: '#38bdf8',
 			title: '正常区间',
-			body: '价格在趋势通道内波动。做T模式：跌0.50%买入，涨0.50%卖出。铁律：收盘前必须平回仓位！',
+			body: (t) =>
+				`价格在趋势通道内波动。做T模式：跌${pct(t.normal)}买入，涨${pct(t.normal)}卖出。铁律：收盘前必须平回仓位！`,
 			icon: MapPin
 		},
 		high: {
@@ -99,7 +117,8 @@
 			tagClass: 'tag-sell',
 			color: '#fb923c',
 			title: '高估区',
-			body: '价格高于95%历史交易日，日内冲高即减仓，涨≥0.40%（相对开盘）执行减仓，不追回。',
+			body: (t) =>
+				`价格高于95%历史交易日，日内冲高即减仓，涨≥${pct(t.zone)}（相对开盘）执行减仓，不追回。`,
 			icon: TriangleAlert
 		},
 		extreme_high: {
@@ -107,7 +126,8 @@
 			tagClass: 'tag-sell',
 			color: '#f87171',
 			title: '极端高估',
-			body: '当前价格远高于历史99%分位，是大幅减仓信号。日内涨0.40%即减仓，不追回。',
+			body: (t) =>
+				`当前价格远高于历史99%分位，是大幅减仓信号。日内涨${pct(t.zone)}即减仓，不追回。`,
 			icon: TriangleAlert
 		}
 	};
@@ -158,9 +178,15 @@
 
 	const subtitle = $derived(
 		model
-			? `基于 ${model.baseDate}–${history[history.length - 1].date} 共 ${history.length} 周数据建模 | 基准日: ${model.baseDate}`
+			? `基于 ${model.baseDate}–${history[history.length - 1].date} 共 ${history.length} 周数据建模 | 当前模型: ${
+					useWeighted
+						? `近期加权(半衰期${model.halfLifeWeeks}周, 等效${model.effectiveN}周)`
+						: `等权全样本(等效${history.length}周)`
+				} | 基准日: ${model.baseDate}`
 			: ''
 	);
+
+	const tPct = $derived((k: 'zone' | 'normal') => (model ? pct(model.tSignal[k]) : '--'));
 
 	const barPct = $derived(Math.max(0, Math.min(100, 50 + (deviationPct / 0.3) * 50)));
 
@@ -222,28 +248,35 @@
 	});
 
 	function buildChart() {
-		if (!model || !chartCanvas) return;
+		if (!model || !activeFit || !chartCanvas) return;
 		chart?.destroy();
 		const ctx = chartCanvas.getContext('2d');
 		if (!ctx) return;
 
 		const labels = history.map((d) => d.date);
 		const prices: (number | null)[] = history.map((d) => d.price);
-		const trends = history.map((d) => d.trend);
-		const high95 = history.map((d) => d.high95);
-		const low05 = history.map((d) => d.low05);
-		const high99 = history.map((d) => d.high99);
-		const low01 = history.map((d) => d.low01);
+		const trends: number[] = [];
+		const high95: number[] = [];
+		const low05: number[] = [];
+		const high99: number[] = [];
+		const low01: number[] = [];
+
+		const pushSeries = (t: number) => {
+			trends.push(round(t));
+			high95.push(round(t + activeFit.bands.high95));
+			low05.push(round(t + activeFit.bands.low05));
+			high99.push(round(t + activeFit.bands.high99));
+			low01.push(round(t + activeFit.bands.low01));
+		};
+
+		for (const d of history) {
+			pushSeries(trendValue(activeFit, daysFromBase(d.date, model.baseDate)));
+		}
 
 		const lastDays = daysFromBase(history[history.length - 1].date, model.baseDate);
 		for (let i = 1; i <= 30; i++) {
 			labels.push(addDays(history[history.length - 1].date, i));
-			const t = round(trendValue(model, lastDays + i));
-			trends.push(t);
-			high95.push(round(t + model.bands.high95));
-			low05.push(round(t + model.bands.low05));
-			high99.push(round(t + model.bands.high99));
-			low01.push(round(t + model.bands.low01));
+			pushSeries(trendValue(activeFit, lastDays + i));
 			prices.push(null);
 		}
 
@@ -357,7 +390,18 @@
 
 <div class="container">
 	<h1><ChartLine size={22} class="title-icon" /> 515180 中证红利ETF — 趋势通道交易系统</h1>
-	<div class="subtitle">{subtitle || '正在加载历史数据…'}</div>
+	<div class="subtitle-row">
+		<div class="subtitle">{subtitle || '正在加载历史数据…'}</div>
+		<div class="mode-toggle" role="group" aria-label="模型切换">
+			<button class:active={useWeighted} onclick={() => (useWeighted = true)}>近期加权</button>
+			<button class:active={!useWeighted} onclick={() => (useWeighted = false)}>等权全样本</button>
+		</div>
+	</div>
+	{#if model && !model.adjusted}
+		<div class="tag tag-warn" style="margin-bottom:12px;">
+			⚠ 当前历史数据为<b>未复权</b>口径（接口未返回前复权数据），分红除息会使模型失真，请谨慎参考
+		</div>
+	{/if}
 
 	<div class="status-bar">
 		<div class="status-indicator" style="background:{STATUS_COLOR[status]};"></div>
@@ -402,7 +446,7 @@
 
 		<div class="card">
 			<div class="card-title">今日操作建议</div>
-			{#if zone}
+			{#if zone && model}
 				{@const ZoneIcon = ZONE_META[zone].icon}
 				<div
 					class="advice-box {zone.includes('low')
@@ -415,8 +459,26 @@
 						<ZoneIcon size={16} />
 						{ZONE_META[zone].title}
 					</div>
-					<p>{ZONE_META[zone].body}</p>
+					<p>{ZONE_META[zone].body(model.tSignal)}</p>
 				</div>
+				{#if altZone && agree !== null}
+					{#if agree}
+						<div
+							class="tag"
+							style="margin-top:10px;background:rgba(34,197,94,0.15);color:var(--buy);"
+						>
+							✓ 双模型一致：{useWeighted ? '等权全样本' : '近期加权'}模型同样判断为「{ZONE_META[
+								altZone
+							].label}」，信号可信度高
+						</div>
+					{:else}
+						<div class="tag tag-warn" style="margin-top:10px;">
+							⚠ 双模型分歧：当前模型→「{ZONE_META[zone].label}」 vs {useWeighted
+								? '等权全样本'
+								: '近期加权'}模型→「{ZONE_META[altZone].label}」，建议谨慎，可切换对照
+						</div>
+					{/if}
+				{/if}
 			{:else}
 				<p style="font-size:0.9rem;">正在计算…</p>
 			{/if}
@@ -427,8 +489,9 @@
 		<div class="card">
 			<div class="card-title"><Ruler size={15} /> 今日趋势通道价格</div>
 			<div class="formula">
-				{#if model}
-					Trend(t) = {model.intercept.toFixed(4)} + {model.slope.toFixed(6)} × t (t=距{model.baseDate}天数)
+				{#if model && activeFit}
+					Trend(t) = {activeFit.intercept.toFixed(4)} + {activeFit.slope.toFixed(6)} × t (t=距{model.baseDate}天数)
+					【{useWeighted ? '近期加权' : '等权全样本'}】
 				{:else}
 					Trend(t) = …
 				{/if}
@@ -450,21 +513,29 @@
 		</div>
 
 		<div class="card">
-			<div class="card-title"><Target size={15} /> 日内做T阈值</div>
-			<div class="t-thresholds">
-				<div class="t-card">
-					<div class="t-val" style="color:var(--buy);">0.40%</div>
-					<div class="t-label">低估区<br />跌≥0.40% → 加仓</div>
+			<div class="card-title"><Target size={15} /> 日内做T阈值（随近期波动自适应）</div>
+			{#if model}
+				<div class="t-thresholds">
+					<div class="t-card">
+						<div class="t-val" style="color:var(--buy);">{tPct('zone')}</div>
+						<div class="t-label">低估区<br />跌≥{tPct('zone')} → 加仓</div>
+					</div>
+					<div class="t-card">
+						<div class="t-val" style="color:var(--sell);">{tPct('zone')}</div>
+						<div class="t-label">高估区<br />涨≥{tPct('zone')} → 减仓</div>
+					</div>
+					<div class="t-card">
+						<div class="t-val" style="color:var(--accent);">{tPct('normal')}</div>
+						<div class="t-label">正常区<br />±{tPct('normal')} → 做T</div>
+					</div>
 				</div>
-				<div class="t-card">
-					<div class="t-val" style="color:var(--sell);">0.40%</div>
-					<div class="t-label">高估区<br />涨≥0.40% → 减仓</div>
+				<div class="refresh-info" style="margin-top:8px;">
+					基准：近{model.tSignal.windowDays}个交易日日内振幅中位数 {pct(model.tSignal.medianAmp)}
+					（正常区 = 中位振幅 × 0.45，下限0.50% / 上限1.00%；高低估区为其0.8倍，下限0.40% / 上限0.80%）
 				</div>
-				<div class="t-card">
-					<div class="t-val" style="color:var(--accent);">0.50%</div>
-					<div class="t-label">正常区<br />±0.50% → 做T</div>
-				</div>
-			</div>
+			{:else}
+				<p class="placeholder">加载中…</p>
+			{/if}
 			<div class="advice-box" style="margin-top:12px;font-size:0.8rem;">
 				<b>铁律：</b>正常区做T，无论盈亏，<b>收盘前必须把T出去的仓位平回来</b
 				>。低估区加仓可持有，高估区减仓不追回。
@@ -504,13 +575,24 @@
 		<div class="card-title"><ClipboardList size={15} /> 交易纪律速查</div>
 		<ol class="rules">
 			<li><b>每日开盘前</b>：计算今日五条关键价格（趋势值、高低估线）</li>
-			<li>
-				<b>低估区</b>（价格 &lt; 低估线）：日内每跌0.40%（相对开盘）→ <b>加仓</b>，收盘前保持加仓
-			</li>
-			<li>
-				<b>高估区</b>（价格 &gt; 高估线）：日内每涨0.40%（相对开盘）→ <b>减仓</b>，收盘前保持减仓
-			</li>
-			<li><b>正常区间</b>：跌0.50%买入，涨0.50%卖出 → <b>做T</b>，尾盘必须平回仓位</li>
+			{#if model}
+				<li>
+					<b>低估区</b>（价格 &lt; 低估线）：日内每跌{tPct('zone')}（相对开盘）→
+					<b>加仓</b>，收盘前保持加仓
+				</li>
+				<li>
+					<b>高估区</b>（价格 &gt; 高估线）：日内每涨{tPct('zone')}（相对开盘）→
+					<b>减仓</b>，收盘前保持减仓
+				</li>
+				<li>
+					<b>正常区间</b>：跌{tPct('normal')}买入，涨{tPct('normal')}卖出 →
+					<b>做T</b>，尾盘必须平回仓位
+				</li>
+			{:else}
+				<li><b>低估区</b>：日内每跌（相对开盘）→ <b>加仓</b>，收盘前保持加仓</li>
+				<li><b>高估区</b>：日内每涨（相对开盘）→ <b>减仓</b>，收盘前保持减仓</li>
+				<li><b>正常区间</b>：低买高卖 → <b>做T</b>，尾盘必须平回仓位</li>
+			{/if}
 			<li><b>极端区间</b>（触及1%/99%线）：大幅加仓/减仓，不犹豫</li>
 		</ol>
 	</div>
@@ -555,10 +637,42 @@
 	.title-icon {
 		color: var(--accent);
 	}
+	.subtitle-row {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 12px;
+		flex-wrap: wrap;
+		margin-bottom: 20px;
+	}
 	.subtitle {
 		color: var(--muted);
 		font-size: 0.9rem;
-		margin-bottom: 20px;
+	}
+	.mode-toggle {
+		display: inline-flex;
+		background: var(--card);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		padding: 2px;
+		gap: 2px;
+	}
+	.mode-toggle button {
+		background: transparent;
+		border: none;
+		color: var(--muted);
+		font-size: 0.75rem;
+		font-weight: 600;
+		padding: 4px 12px;
+		border-radius: 6px;
+		cursor: pointer;
+		transition:
+			background 0.2s,
+			color 0.2s;
+	}
+	.mode-toggle button.active {
+		background: var(--accent);
+		color: #0f172a;
 	}
 
 	.grid {
