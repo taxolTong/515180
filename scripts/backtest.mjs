@@ -11,14 +11,13 @@
  * - 做T阈值与看板一致：近20日日内振幅中位数 × 0.45（0.50%~1.00%），高低估区为其0.8倍
  * - 费用：佣金万二、最低5元，卖出无印花税（ETF），无滑点
  *
- * 用法: node scripts/backtest.mjs [起始日期，默认 2025-01-01]
+ * 用法: node scripts/backtest.mjs [起始日期，默认 2025-01-01] [输出目录，默认 backtest/]
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const OUT_DIR = join(ROOT, 'backtest');
 
 const START_DATE = '2024-09-01'; // 建模起点（与看板一致）
 const HALF_LIFE_WEEKS = 26;
@@ -34,6 +33,7 @@ const COMMISSION_MIN = 5;
 const UNIT = 10000; // 每份股数（做T单位 = 底仓单位）
 
 const BT_START = process.argv[2] ?? '2025-01-01';
+const OUT_DIR = process.argv[3] ? resolve(ROOT, process.argv[3]) : join(ROOT, 'backtest');
 
 const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 const fee = (amount) => Math.max(COMMISSION_MIN, amount * COMMISSION_RATE);
