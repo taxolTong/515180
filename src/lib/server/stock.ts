@@ -1,4 +1,4 @@
-import type { HistoryPoint, HistoryResponse, Quote, TSignal } from '$lib/types';
+import type { HistoryPoint, HistoryResponse, ModelFit, OptimizedModel, Quote, TSignal } from '$lib/types';
 import { round } from '$lib/model';
 
 const START_DATE = '2024-09-01';
@@ -17,6 +17,20 @@ const NORMAL_MAX = 0.01;
 const ZONE_RATIO = 0.8;
 const ZONE_MIN = 0.004;
 const ZONE_MAX = 0.008;
+
+// 模型三「B092 优化版」（20261027 实验全历史验证最优，backtest/20261027-models-full）：
+// 通道放宽到残差 23%/77%（极端 2%/98%）；T 阈值 = 近60日振幅 Q0.33 × 0.58（限 0.4%~1.5%），
+// 区触发 = T × 0.63（限 0.4%~1.2%）；T 单过夜：目标 +T×1.4、止损 −T×0.5、最长 5 日；每笔固定 1 万元。
+const OPT_ZONE_P = 0.23;
+const OPT_EXTREME_P = 0.02;
+const OPT_AMP_WINDOW = 60;
+const OPT_AMP_Q = 0.33;
+const OPT_T_K = 0.58;
+const OPT_T_MIN = 0.004;
+const OPT_T_MAX = 0.015;
+const OPT_ZONE_RATIO = 0.63;
+const OPT_ZONE_MIN = 0.004;
+const OPT_ZONE_MAX = 0.012;
 
 let historyCache: { at: number; data: HistoryResponse } | null = null;
 
@@ -52,7 +66,8 @@ function daysBetween(a: string, b: string): number {
 	return (new Date(b + 'T00:00:00Z').getTime() - new Date(a + 'T00:00:00Z').getTime()) / 86400000;
 }
 
-async function fetchDailyAmplitude(): Promise<number> {
+/** 拉取日K并返回日内振幅序列（(最高−最低)/开盘，正数，按时间正序） */
+async function fetchDailyAmps(): Promise<number[]> {
 	const url = 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh515180,day,,,320,qfq';
 	const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
 	if (!res.ok) throw new Error(`日K请求失败: ${res.status}`);
@@ -66,11 +81,9 @@ async function fetchDailyAmplitude(): Promise<number> {
 			const open = parseFloat(r[1]);
 			return open > 0 ? (parseFloat(r[3]) - parseFloat(r[4])) / open : 0;
 		})
-		.filter((a) => a > 0)
-		.slice(-AMP_WINDOW);
+		.filter((a) => a > 0);
 	if (!amps.length) throw new Error('日K振幅数据不足');
-	amps.sort((a, b) => a - b);
-	return amps[Math.floor(amps.length / 2)]; // 中位数
+	return amps;
 }
 
 async function fetchHistory(): Promise<HistoryResponse> {
@@ -148,7 +161,7 @@ async function fetchHistory(): Promise<HistoryResponse> {
 						)
 					)
 				};
-		return { intercept: round(intercept), slope: round(slope, 6), bands };
+		return { intercept: round(intercept), slope: round(slope, 6), bands, residuals, weights: ws };
 	};
 
 	const weights = xs.map((x) => 0.5 ** ((xs[n - 1] - x) / 7 / HALF_LIFE_WEEKS));
@@ -157,8 +170,25 @@ async function fetchHistory(): Promise<HistoryResponse> {
 	const W = weights.reduce((a, b) => a + b, 0);
 	const effectiveN = round((W * W) / weights.reduce((a, w) => a + w * w, 0), 1);
 
-	// 动态做T阈值（问题二）
-	const medianAmp = await fetchDailyAmplitude();
+	// —— 模型三「B092 优化版」：沿用近期加权拟合，通道放宽到 23%/77%（极端 2%/98%） ——
+	const optimizedFit: ModelFit = {
+		intercept: weighted.intercept,
+		slope: weighted.slope,
+		bands: {
+			high95: round(weightedQuantile(weighted.residuals, weighted.weights, 1 - OPT_ZONE_P)), // 77%
+			low05: round(weightedQuantile(weighted.residuals, weighted.weights, OPT_ZONE_P)), // 23%
+			high99: round(weightedQuantile(weighted.residuals, weighted.weights, 1 - OPT_EXTREME_P)), // 98%
+			low01: round(weightedQuantile(weighted.residuals, weighted.weights, OPT_EXTREME_P)) // 2%
+		}
+	};
+
+	// 动态做T阈值：原方案（近20日中位数）与 B092（近60日 Q0.33）
+	const ampSeries = await fetchDailyAmps();
+	const sorted = (arr: number[]) => [...arr].sort((a, b) => a - b);
+	const medianAmp = (() => {
+		const amps = sorted(ampSeries.slice(-AMP_WINDOW));
+		return amps.length ? amps[Math.floor(amps.length / 2)] : 0;
+	})();
 	const normal = clamp(medianAmp * NORMAL_K, NORMAL_MIN, NORMAL_MAX);
 	const zone = clamp(normal * ZONE_RATIO, ZONE_MIN, ZONE_MAX);
 	const tSignal: TSignal = {
@@ -168,12 +198,26 @@ async function fetchHistory(): Promise<HistoryResponse> {
 		windowDays: AMP_WINDOW
 	};
 
+	const optAmpQ = quantile(sorted(ampSeries.slice(-OPT_AMP_WINDOW)), OPT_AMP_Q);
+	const optNormal = clamp(optAmpQ * OPT_T_K, OPT_T_MIN, OPT_T_MAX);
+	const optZone = clamp(optNormal * OPT_ZONE_RATIO, OPT_ZONE_MIN, OPT_ZONE_MAX);
+	const optimized: OptimizedModel = {
+		fit: optimizedFit,
+		tSignal: {
+			normal: round(optNormal, 4),
+			zone: round(optZone, 4),
+			medianAmp: round(optAmpQ, 4),
+			windowDays: OPT_AMP_WINDOW
+		}
+	};
+
 	const history: HistoryPoint[] = points.map((p) => ({ date: p.date, price: p.price }));
 
 	return {
 		baseDate,
 		weighted,
 		unweighted,
+		optimized,
 		adjusted,
 		halfLifeWeeks: HALF_LIFE_WEEKS,
 		effectiveN,
