@@ -144,7 +144,7 @@
 		}
 	};
 
-	// 模型三「B092 优化版」（23%/77% 宽通道、T单过夜、每笔固定1万元）
+	// 模型三「B092 优化版」（23%/77% 宽通道、T单过夜、单笔金额固定）
 	const ZONE_META_OPT: Record<Zone, ZoneMeta> = {
 		extreme_low: {
 			label: '极端低估区',
@@ -152,7 +152,7 @@
 			color: '#22c55e',
 			title: '极端低估（2%分位）',
 			body: (t) =>
-				`价格远低于历史2%分位，极限抄底。日内跌${pct(t.zone)}（相对开盘）即加仓1万元，收盘保持仓位。`,
+				`价格远低于历史2%分位，极限抄底。日内跌${pct(t.zone)}（相对开盘）即加仓（单笔金额固定、全程一致），收盘保持仓位。`,
 			icon: Flame
 		},
 		low: {
@@ -161,7 +161,7 @@
 			color: '#4ade80',
 			title: '低估区（23%分位）',
 			body: (t) =>
-				`价格低于77%历史交易日，回调即机会。日内相对开盘跌≥${pct(t.zone)}加仓1万元，不T出。`,
+				`价格低于77%历史交易日，回调即机会。日内相对开盘跌≥${pct(t.zone)}加仓（单笔金额固定），不T出。`,
 			icon: CircleCheck
 		},
 		normal: {
@@ -170,7 +170,7 @@
 			color: '#38bdf8',
 			title: '正常区间',
 			body: (t) =>
-				`做T：跌${pct(t.normal)}买入1万元，涨${pct(t.normal)}卖出。未达对侧阈值时T单可过夜——目标+${pct(t.normal * 1.4)}、止损−${pct(t.normal * 0.5)}、最长5日强制了结，不再尾盘强平。`,
+				`做T：跌${pct(t.normal)}买入、涨${pct(t.normal)}卖出（单笔金额固定、全程一致）。未达对侧阈值时T单可过夜——目标+${pct(t.normal * 1.4)}、止损−${pct(t.normal * 0.5)}、最长5日强制了结，不再尾盘强平。`,
 			icon: MapPin
 		},
 		high: {
@@ -179,7 +179,7 @@
 			color: '#fb923c',
 			title: '高估区（77%分位）',
 			body: (t) =>
-				`价格高于77%历史交易日，冲高即减仓。日内相对开盘涨≥${pct(t.zone)}减仓1万元，不追回。`,
+				`价格高于77%历史交易日，冲高即减仓。日内相对开盘涨≥${pct(t.zone)}减仓（单笔金额固定），不追回。`,
 			icon: TriangleAlert
 		},
 		extreme_high: {
@@ -188,7 +188,7 @@
 			color: '#f87171',
 			title: '极端高估（98%分位）',
 			body: (t) =>
-				`价格远高于历史98%分位，大幅减仓信号。日内涨${pct(t.zone)}减仓1万元，不追回。`,
+				`价格远高于历史98%分位，大幅减仓信号。日内涨${pct(t.zone)}减仓（单笔金额固定），不追回。`,
 			icon: TriangleAlert
 		}
 	};
@@ -282,7 +282,7 @@
 	);
 
 	const MODEL_LABEL: Record<'optimized' | 'weighted' | 'unweighted', string> = {
-		optimized: '优化版 B092（通道23/77·T过夜·每笔1万元）',
+		optimized: '优化版 B092（通道23/77·T过夜·单笔金额固定）',
 		weighted: `近期加权(半衰期26周)`,
 		unweighted: '等权全样本'
 	};
@@ -638,11 +638,11 @@
 				<div class="t-thresholds">
 					<div class="t-card">
 						<div class="t-val" style="color:var(--buy);">{tPct('zone')}</div>
-						<div class="t-label">低估区<br />跌≥{tPct('zone')} → 加仓1万元</div>
+						<div class="t-label">低估区<br />跌≥{tPct('zone')} → 加仓（金额固定）</div>
 					</div>
 					<div class="t-card">
 						<div class="t-val" style="color:var(--sell);">{tPct('zone')}</div>
-						<div class="t-label">高估区<br />涨≥{tPct('zone')} → 减仓1万元</div>
+						<div class="t-label">高估区<br />涨≥{tPct('zone')} → 减仓（金额固定）</div>
 					</div>
 					<div class="t-card">
 						<div class="t-val" style="color:var(--accent);">{tPct('normal')}</div>
@@ -652,7 +652,7 @@
 				{#if mode === 'optimized'}
 					<div class="refresh-info" style="margin-top:8px;">
 						基准：近{tSig.windowDays}日振幅 Q0.33 = {pct(tSig.medianAmp)}（×0.58，限0.40%~1.50%；区触发×0.63，限0.40%~1.20%）
-						| T单过夜：目标 +T×1.4、止损 −T×0.5、最长5日 | 每笔固定1万元
+						| T单过夜：目标 +T×1.4、止损 −T×0.5、最长5日
 					</div>
 				{:else}
 					<div class="refresh-info" style="margin-top:8px;">
@@ -665,7 +665,7 @@
 			{/if}
 			{#if mode === 'optimized'}
 				<div class="advice-box" style="margin-top:12px;font-size:0.8rem;">
-					<b>纪律（优化版）：</b>每笔固定<b>1万元</b>（股数=1万÷成交价取整100股）。正常区做T<b>允许过夜</b
+					<b>纪律（优化版）：</b>单笔金额固定、自定、全程一致（股数按成交价换算取整）。正常区做T<b>允许过夜</b
 					>：未达对侧阈值时持有，目标 +T×1.4 / 止损 −T×0.5 / 最长5日强制了结；同日止盈止损都触发按止损执行。低估区加仓持有、高估区减仓不追回。
 				</div>
 			{:else}
@@ -705,24 +705,25 @@
 		</div>
 	</div>
 
-	<div class="card" style="margin-top:16px;">
-		<div class="card-title"><ClipboardList size={15} /> 交易纪律速查</div>
-		<ol class="rules">
+	<div class="grid grid-2" style="margin-top:16px;">
+		<div class="card">
+			<div class="card-title"><ClipboardList size={15} /> 交易纪律速查</div>
+			<ol class="rules">
 			<li><b>每日开盘前</b>：计算今日五条关键价格（趋势值、高低估线）</li>
 			{#if model && tSig}
 				{#if mode === 'optimized'}
 					<li>
-						<b>低估区</b>（价格 &lt; 低估线23%）：日内跌{tPct('zone')}（相对开盘）→ <b>加仓1万元</b>，收盘保持
+						<b>低估区</b>（价格 &lt; 低估线23%）：日内跌{tPct('zone')}（相对开盘）→ <b>加仓</b>（单笔金额固定），收盘保持
 					</li>
 					<li>
-						<b>高估区</b>（价格 &gt; 高估线77%）：日内涨{tPct('zone')}（相对开盘）→ <b>减仓1万元</b>，不追回
+						<b>高估区</b>（价格 &gt; 高估线77%）：日内涨{tPct('zone')}（相对开盘）→ <b>减仓</b>（单笔金额固定），不追回
 					</li>
 					<li>
 						<b>正常区间</b>：跌{tPct('normal')}买入、涨{tPct('normal')}卖出 → <b>做T</b>；未达对侧阈值可过夜，目标
 						+{pct(tSig.normal * 1.4)} / 止损 −{pct(tSig.normal * 0.5)} / 最长5日了结
 					</li>
 					<li>
-						<b>极端区间</b>（触及2%/98%线）：大幅加仓/减仓，不犹豫 | 每笔固定1万元，5万循环额度不超额
+						<b>极端区间</b>（触及2%/98%线）：大幅加仓/减仓，不犹豫 | 单笔金额固定，循环额度内操作、不超额
 					</li>
 				{:else}
 					<li>
@@ -747,7 +748,37 @@
 			{/if}
 		</ol>
 	</div>
-</div>
+		{#if mode === 'optimized'}
+			<div class="card">
+				<div class="card-title"><Flame size={15} /> 优化版 B092 实盘纪律卡</div>
+				<ol class="rules">
+					<li>
+						<b>通道判断</b>：开盘对照五条线——低于23%线为低估区（低于2%线为极端低估），高于77%线为高估区（高于98%线为极端高估），其余为正常区
+					</li>
+					<li>
+						<b>加减仓</b>：低估区较开盘跌≥区触发阈值 → <b>加仓持有</b>；高估区较开盘涨≥区触发阈值 →
+						<b>减仓不追回</b>；单笔金额固定、自定、全程一致
+					</li>
+					<li>
+						<b>做T（正常区）</b>：跌≥T买入、涨≥T卖出；T = 近60日日内振幅Q0.33 × 0.58（自适应，限0.4%~1.5%），按看板当日显示值执行
+					</li>
+					<li>
+						<b>过夜T单三要素</b>：目标价 = 买入价×(1+1.4T)、止损价 = 买入价×(1−0.5T)、最长5个交易日强制了结；同日止盈止损都触发按止损执行
+					</li>
+					<li>
+						<b>资金管理</b>：只用可循环活动资金、任时刻不超额；佣金万二最低5元，高频小单有磨损
+					</li>
+					<li><b>红线</b>：信号之外的操作需记录原因，不因情绪改变单笔金额</li>
+				</ol>
+			</div>
+		{:else}
+			<div class="card">
+				<div class="card-title"><ClipboardList size={15} /> 优化版纪律卡</div>
+				<p class="placeholder">切换到「B092 优化版」模型查看实盘纪律卡</p>
+			</div>
+		{/if}
+	</div>
+	</div>
 
 <style>
 	:global(:root) {
