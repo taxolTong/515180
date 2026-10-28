@@ -40,6 +40,7 @@
 	let status = $state<'loading' | 'ok' | 'error' | 'manual'>('loading');
 	let statusText = $state('正在获取实时行情…');
 	let manualPrice = $state('');
+	let lastEntryInput = $state(''); // 未临期隔夜单平仓线：上一次操作价格
 	let chartCanvas = $state<HTMLCanvasElement | null>(null);
 	let chart: Chart | null = null;
 	// 三套模型：optimized=B092优化版（回测全历史验证最优，默认选中）、weighted=近期加权、unweighted=等权全样本
@@ -144,7 +145,7 @@
 		}
 	};
 
-	// 模型三「B092 优化版」（23%/77% 宽通道、T单过夜、单笔金额固定）
+	// 模型三「B092 优化版」（23%/77% 宽通道、T单过夜）
 	const ZONE_META_OPT: Record<Zone, ZoneMeta> = {
 		extreme_low: {
 			label: '极端低估区',
@@ -152,7 +153,7 @@
 			color: '#22c55e',
 			title: '极端低估（2%分位）',
 			body: (t) =>
-				`价格远低于历史2%分位，极限抄底。日内跌${pct(t.zone)}（相对开盘）即加仓（单笔金额固定、全程一致），收盘保持仓位。`,
+				`价格远低于历史2%分位。日内跌${pct(t.zone)}（相对开盘）即加仓，收盘保持仓位。`,
 			icon: Flame
 		},
 		low: {
@@ -161,7 +162,7 @@
 			color: '#4ade80',
 			title: '低估区（23%分位）',
 			body: (t) =>
-				`价格低于77%历史交易日，回调即机会。日内相对开盘跌≥${pct(t.zone)}加仓（单笔金额固定），不T出。`,
+				`价格低于23%分位，回调即机会。日内相对开盘跌≥${pct(t.zone)}加仓，不T出。`,
 			icon: CircleCheck
 		},
 		normal: {
@@ -170,7 +171,7 @@
 			color: '#38bdf8',
 			title: '正常区间',
 			body: (t) =>
-				`做T：跌${pct(t.normal)}买入、涨${pct(t.normal)}卖出（单笔金额固定、全程一致）。未达对侧阈值时T单可过夜——目标+${pct(t.normal * 1.4)}、止损−${pct(t.normal * 0.5)}、最长5日强制了结，不再尾盘强平。`,
+				`做T：跌${pct(t.normal)}买入、涨${pct(t.normal)}卖出。T单可过夜：+${pct(t.normal * 1.4)}平回、−${pct(t.normal * 0.5)}止损、持有≤5日。`,
 			icon: MapPin
 		},
 		high: {
@@ -179,7 +180,7 @@
 			color: '#fb923c',
 			title: '高估区（77%分位）',
 			body: (t) =>
-				`价格高于77%历史交易日，冲高即减仓。日内相对开盘涨≥${pct(t.zone)}减仓（单笔金额固定），不追回。`,
+				`价格高于77%分位，冲高即减仓。日内相对开盘涨≥${pct(t.zone)}减仓，不追回。`,
 			icon: TriangleAlert
 		},
 		extreme_high: {
@@ -188,7 +189,7 @@
 			color: '#f87171',
 			title: '极端高估（98%分位）',
 			body: (t) =>
-				`价格远高于历史98%分位，大幅减仓信号。日内涨${pct(t.zone)}减仓（单笔金额固定），不追回。`,
+				`价格远高于历史98%分位，大幅减仓信号。日内涨${pct(t.zone)}减仓，不追回。`,
 			icon: TriangleAlert
 		}
 	};
@@ -282,7 +283,7 @@
 	);
 
 	const MODEL_LABEL: Record<'optimized' | 'weighted' | 'unweighted', string> = {
-		optimized: '优化版 B092（通道23/77·T过夜·单笔金额固定）',
+		optimized: '优化版 B092（通道23/77·T过夜）',
 		weighted: `近期加权(半衰期26周)`,
 		unweighted: '等权全样本'
 	};
@@ -294,6 +295,35 @@
 	);
 
 	const tPct = $derived((k: 'zone' | 'normal') => (tSig ? pct(tSig[k]) : '--'));
+
+	// 日内买卖触发价（以今日开盘为基准 ±T）
+	const fmtP = (x: number) => x.toFixed(3);
+	const overnight = $derived.by(() => {
+		if (!tSig || !effective || history.length < 2) return null;
+		const T = tSig.normal;
+		const o = effective.open || effective.price;
+		return { T, buyTrig: o * (1 - T), sellTrig: o * (1 + T) };
+	});
+
+	// 未临期隔夜单平仓线：输入上一次操作价格（严格三位小数、1.000~2.000），按今日 T 给出加/减仓的止盈止损
+	const ENTRY_PRICE_RE = /^\d+\.\d{3}$/;
+	const customOvernight = $derived.by(() => {
+		if (!tSig) return null;
+		const T = tSig.normal;
+		const s = lastEntryInput.trim();
+		if (s === '') return { T, status: 'idle' as const };
+		if (!ENTRY_PRICE_RE.test(s) || !isValidPrice(parseFloat(s))) return { T, status: 'error' as const };
+		const entry = parseFloat(s);
+		return {
+			T,
+			status: 'ok' as const,
+			entry,
+			buyTp: entry * (1 + 1.4 * T), // 加仓（买入）止盈
+			buySl: entry * (1 - 0.5 * T), // 加仓（买入）止损
+			sellTp: entry * (1 - 1.4 * T), // 减仓（卖出）止盈
+			sellSl: entry * (1 + 0.5 * T) // 减仓（卖出）止损
+		};
+	});
 
 	const barPct = $derived(Math.max(0, Math.min(100, 50 + (deviationPct / 0.3) * 50)));
 
@@ -575,13 +605,7 @@
 					</div>
 					<p>{META[zone].body(tSig)}</p>
 				</div>
-				{#if mode === 'optimized'}
-					<div class="tag tag-warn" style="margin-top:10px;">
-						优化版通道更宽、信号更多；旧口径（5%/95%）下当前为「{altZone
-							? ZONE_META[altZone].label
-							: '—'}」，差异属正常，纪律按当前模型执行
-					</div>
-				{:else if altZone && agree !== null}
+				{#if mode !== 'optimized' && altZone && agree !== null}
 					{#if agree}
 						<div
 							class="tag"
@@ -652,7 +676,6 @@
 				{#if mode === 'optimized'}
 					<div class="refresh-info" style="margin-top:8px;">
 						基准：近{tSig.windowDays}日振幅 Q0.33 = {pct(tSig.medianAmp)}（×0.58，限0.40%~1.50%；区触发×0.63，限0.40%~1.20%）
-						| T单过夜：目标 +T×1.4、止损 −T×0.5、最长5日
 					</div>
 				{:else}
 					<div class="refresh-info" style="margin-top:8px;">
@@ -665,9 +688,46 @@
 			{/if}
 			{#if mode === 'optimized'}
 				<div class="advice-box" style="margin-top:12px;font-size:0.8rem;">
-					<b>纪律（优化版）：</b>单笔金额固定、自定、全程一致（股数按成交价换算取整）。正常区做T<b>允许过夜</b
-					>：未达对侧阈值时持有，目标 +T×1.4 / 止损 −T×0.5 / 最长5日强制了结；同日止盈止损都触发按止损执行。低估区加仓持有、高估区减仓不追回。
+					<b>纪律（优化版）：</b>正常区做T<b>允许过夜</b>：持有≤5日，<b
+						>+1.4T 平回、−0.5T 止损</b
+					>，第5日尾盘强平。低估区加仓持有、高估区减仓不追回。
 				</div>
+				{#if customOvernight}
+					<div class="entry-calc">
+						<div class="input-group entry-input">
+							<input
+								type="text"
+								inputmode="decimal"
+								bind:value={lastEntryInput}
+								placeholder="未临期隔夜单平仓线（输入上次操作价，三位小数）"
+							/>
+						</div>
+						{#if customOvernight.status === 'error'}
+							<div class="refresh-info" style="color:var(--sell)">
+								请输入三位小数、且在 1.000 ~ 2.000 之间的价格（如 1.360）
+							</div>
+						{:else if customOvernight.status === 'ok'}
+							<div class="calc-grid">
+								<div class="calc-item">
+									<span class="calc-label">加仓止盈</span>
+									<b class="calc-val" style="color:var(--buy)">{fmtP(customOvernight.buyTp)}</b>
+								</div>
+								<div class="calc-item">
+									<span class="calc-label">加仓止损</span>
+									<b class="calc-val" style="color:var(--sell)">{fmtP(customOvernight.buySl)}</b>
+								</div>
+								<div class="calc-item">
+									<span class="calc-label">减仓止盈</span>
+									<b class="calc-val" style="color:var(--buy)">{fmtP(customOvernight.sellTp)}</b>
+								</div>
+								<div class="calc-item">
+									<span class="calc-label">减仓止损</span>
+									<b class="calc-val" style="color:var(--sell)">{fmtP(customOvernight.sellSl)}</b>
+								</div>
+							</div>
+						{/if}
+					</div>
+				{/if}
 			{:else}
 				<div class="advice-box" style="margin-top:12px;font-size:0.8rem;">
 					<b>铁律：</b>正常区做T，无论盈亏，<b>收盘前必须把T出去的仓位平回来</b
@@ -713,17 +773,18 @@
 			{#if model && tSig}
 				{#if mode === 'optimized'}
 					<li>
-						<b>低估区</b>（价格 &lt; 低估线23%）：日内跌{tPct('zone')}（相对开盘）→ <b>加仓</b>（单笔金额固定），收盘保持
+						<b>低估区</b>（价格 &lt; 低估线23%）：日内跌{tPct('zone')}（相对开盘）→ <b>加仓</b>，收盘保持
 					</li>
 					<li>
-						<b>高估区</b>（价格 &gt; 高估线77%）：日内涨{tPct('zone')}（相对开盘）→ <b>减仓</b>（单笔金额固定），不追回
+						<b>高估区</b>（价格 &gt; 高估线77%）：日内涨{tPct('zone')}（相对开盘）→ <b>减仓</b>，不追回
 					</li>
 					<li>
-						<b>正常区间</b>：跌{tPct('normal')}买入、涨{tPct('normal')}卖出 → <b>做T</b>；未达对侧阈值可过夜，目标
-						+{pct(tSig.normal * 1.4)} / 止损 −{pct(tSig.normal * 0.5)} / 最长5日了结
+						<b>正常区间</b>：跌{tPct('normal')}买入、涨{tPct('normal')}卖出 → <b>做T</b>；T单可过夜（多笔并存、各单独立计期），+{pct(
+							tSig.normal * 1.4
+						)}平回 / −{pct(tSig.normal * 0.5)}止损 / 第5日尾盘强平
 					</li>
 					<li>
-						<b>极端区间</b>（触及2%/98%线）：大幅加仓/减仓，不犹豫 | 单笔金额固定，循环额度内操作、不超额
+						<b>极端区间</b>（触及2%/98%线）：大幅加仓/减仓，不犹豫
 					</li>
 				{:else}
 					<li>
@@ -757,18 +818,18 @@
 					</li>
 					<li>
 						<b>加减仓</b>：低估区较开盘跌≥区触发阈值 → <b>加仓持有</b>；高估区较开盘涨≥区触发阈值 →
-						<b>减仓不追回</b>；单笔金额固定、自定、全程一致
+						<b>减仓不追回</b>
 					</li>
 					<li>
-						<b>做T（正常区）</b>：跌≥T买入、涨≥T卖出；T = 近60日日内振幅Q0.33 × 0.58（自适应，限0.4%~1.5%），按看板当日显示值执行
+						<b>做T（正常区）</b>：{#if overnight}今日开盘后 跌至 <b>{fmtP(overnight.buyTrig)}</b>（−{pct(
+							overnight.T
+						)}）买入、涨至 <b>{fmtP(overnight.sellTrig)}</b>（+{pct(overnight.T)}）卖出；{:else}跌≥T买入、涨≥T卖出；{/if}T
+						= 近60日日内振幅Q0.33 × 0.58（自适应，限0.4%~1.5%），按看板当日显示值执行
 					</li>
 					<li>
-						<b>过夜T单三要素</b>：目标价 = 买入价×(1+1.4T)、止损价 = 买入价×(1−0.5T)、最长5个交易日强制了结；同日止盈止损都触发按止损执行
+						<b>隔夜T单</b>：持有≤5日，<b>+1.4T 平回、−0.5T 止损</b>；第5日未触发 → 尾盘按收盘价强平。平仓线用上方「未临期隔夜单平仓线」输入上次操作价计算
 					</li>
-					<li>
-						<b>资金管理</b>：只用可循环活动资金、任时刻不超额；佣金万二最低5元，高频小单有磨损
-					</li>
-					<li><b>红线</b>：信号之外的操作需记录原因，不因情绪改变单笔金额</li>
+					<li><b>红线</b>：信号之外的操作需记录原因，不因情绪改变计划</li>
 				</ol>
 			</div>
 		{:else}
@@ -1050,6 +1111,38 @@
 		padding: 8px 12px;
 		border-radius: 8px;
 		font-size: 1rem;
+	}
+	.entry-calc {
+		margin-top: 12px;
+		padding: 10px 12px;
+		border: 1px dashed var(--border);
+		border-radius: 8px;
+		background: rgba(148, 163, 184, 0.06);
+	}
+	.entry-input {
+		max-width: 420px;
+	}
+	.calc-grid {
+		display: grid;
+		grid-template-columns: repeat(4, 1fr);
+		gap: 8px;
+		margin-top: 10px;
+	}
+	.calc-item {
+		background: var(--bg);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		padding: 8px 10px;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.calc-label {
+		font-size: 0.72rem;
+		color: var(--muted);
+	}
+	.calc-val {
+		font-size: 1.05rem;
 	}
 	.btn {
 		background: var(--accent);

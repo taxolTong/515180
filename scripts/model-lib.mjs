@@ -8,11 +8,14 @@
  *   - zoneCooldown：同向区交易最小间隔天数（防宽通道下连续每日触发）
  *   - tExit: 'sameDay'（基线：尾盘强制平回）| 'hold'（允许过夜：
  *     目标价=入场×(1±T×holdTargetK)、止损=×(1∓T×holdStopK)、holdMaxDays 后强制收盘了结）
+ *     | 'signal'（隔夜 T 以下一次反向日内信号平回，平回价=平回日开盘×(1±T)，
+ *     不设相对入场价的止盈/止损；signalReopen=true 时 H3 平回后同价开反向新仓）
  *
  * 共用约束：BASE_SHARES=10000 底仓、INIT_CASH=10000、CAP=50000 循环额度（现金下限-CAP）、
  * 佣金万二最低5元、**每笔操作固定金额 1 万元**（股数=1万÷成交价按100股取整，屏蔽前复权
  * 对固定股数操作价格的失真）、信号用 t 日前已完成周K拟合（无未来函数）、
- * 成交假设与基线一致：限价单触及即按触发价成交；过夜单止盈/止损同日都触及时按止损先成交（保守）。
+ * 成交假设与基线一致：限价单触及即按触发价成交；过夜单止盈/止损同日都触及时按止损先成交（保守），
+ * signal 模式平回当日不再开普通新 T，同一时间最多持有 1 笔过夜 T 单。
  */
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -203,7 +206,10 @@ export function daySignal(cfg, m, d, ampHist) {
  * 过夜持仓单记录每笔实际股数。
  * hold 模式持仓单：buy 单目标=buy×(1+T×holdTargetK)、止损=buy×(1−T×holdStopK)；
  * sell 单（反T）对称；同日止盈止损都触及时按止损成交（保守）；holdMaxDays 后按收盘强制了结。
- * 返回 { cash, shares, endIdx, tStats }
+ * signal 模式持仓单：后续交易日相对当日开盘触及反向 ±T 即平回；不设相对入场价的止盈/止损；
+ * holdMaxDays 后按收盘强制了结。cfg.signalReopen=true（H3）时，平回信号同时开反向新仓，
+ * 若当日再触反向阈值则按现有日内先卖后买/先买后卖顺序了结，且每日最多连锁一次。
+ * 返回 { cash, shares, endIdx, tStats }；tStats.trades 含逐笔 T 明细。
  */
 export function run(cfg, startIdx, days, models, endOverride = null, ampHist = null) {
 	let cash = INIT_CASH;
@@ -213,23 +219,50 @@ export function run(cfg, startIdx, days, models, endOverride = null, ampHist = n
 	const qtyOf = (price) => lot(AMOUNT / price);
 	const affordable = (price, q) => cash - price * q - fee(price * q) >= -CAP;
 
-	let openBuys = []; // {px, day, target, stop, qty}
-	let openSells = []; // {px, day, target, stop, qty}
+	let openBuys = []; // hold: {px, day, target, stop, qty}；signal: {px, day, qty}
+	let openSells = []; // 同上
 	let lastZoneBuyDay = -1e9;
 	let lastZoneSellDay = -1e9;
 	let tProfit = 0;
 	let tWin = 0;
 	let tCount = 0;
-	let tFailClose = 0; // 尾盘不利价平回次数（sameDay 模式下 close<buy 或 close>sell）
+	let tFailClose = 0; // 尾盘不利价平回次数（sameDay 全部、hold 第 holdMaxDays 日强平）
+	let tForceClose = 0; // 第 holdMaxDays 日尾盘强平次数（不含期末窗口强平）
+	let tHoldDays = 0; // 全部 T 笔的持仓交易日合计（同日往返=1）
+	let tMaxLoss = 0;
 	let zoneBuyCount = 0;
 	let zoneSellCount = 0;
+	const tExitCounts = { sameDay: 0, signal: 0, target: 0, stop: 0, force: 0, end: 0 };
+	const trades = [];
 
-	const closeT = (px, exitPx, q) => {
-		const p = (exitPx - px) * q;
+	const closeT = (px, exitPx, q, side, entryDay, exitDay, exitReason) => {
+		const gross = (side === 'short' ? px - exitPx : exitPx - px) * q;
 		const f = fee(px * q) + fee(exitPx * q);
-		tProfit += p - f;
+		const net = gross - f;
+		const holdDays = exitDay - entryDay + 1;
+		tProfit += net;
 		tCount++;
-		if (p - f > 0) tWin++;
+		if (net > 0) tWin++;
+		if (exitReason === 'sameDay') tFailClose++;
+		if (exitReason === 'force') {
+			tFailClose++;
+			tForceClose++;
+		}
+		tExitCounts[exitReason]++;
+		tHoldDays += holdDays;
+		if (net < tMaxLoss) tMaxLoss = net;
+		trades.push({
+			side,
+			qty: q,
+			entryDate: days[entryDay].date,
+			exitDate: days[exitDay].date,
+			entryPx: px,
+			exitPx,
+			gross: +gross.toFixed(2),
+			net: +net.toFixed(2),
+			holdDays,
+			exitReason
+		});
 	};
 
 	for (let i = startIdx; i <= endIdx; i++) {
@@ -240,34 +273,126 @@ export function run(cfg, startIdx, days, models, endOverride = null, ampHist = n
 
 		// 1) 过夜单了结（先释放资金/份额）
 		const T = sig.normalT;
-		openBuys = openBuys.filter((p) => {
-			let exit = null;
-			if (d.low <= p.stop) exit = p.stop; // 保守：止损优先
-			else if (d.high >= p.target) exit = p.target;
-			else if (i - p.day >= cfg.holdMaxDays) exit = d.close;
-			if (exit == null) return true;
-			cash += exit * p.qty - fee(exit * p.qty);
-			shares -= p.qty;
-			closeT(p.px, exit, p.qty);
-			if (exit === d.close) tFailClose++;
-			return false;
-		});
-		openSells = openSells.filter((p) => {
-			let exit = null;
-			if (d.high >= p.stop) exit = p.stop;
-			else if (d.low <= p.target) exit = p.target;
-			else if (i - p.day >= cfg.holdMaxDays) exit = d.close;
-			if (exit == null) return true;
-			cash -= exit * p.qty + fee(exit * p.qty);
-			shares += p.qty;
-			closeT(p.px, exit, p.qty);
-			if (exit === d.close) tFailClose++;
-			return false;
-		});
+		let signalClosedToday = false; // 平回/强平当日不再开普通新 T（H3 的反向仓已在上面处理）
+		if (cfg.tExit === 'signal') {
+			const reopenedSells = [];
+			openBuys = openBuys.filter((p) => {
+				let exit = null;
+				let reason = null;
+				const sellTrig = d.open * (1 + T);
+				if (d.high >= sellTrig) {
+					exit = sellTrig; // 多单平回只看相对当日开盘 +T
+					reason = 'signal';
+				} else if (i - p.day >= cfg.holdMaxDays) {
+					exit = d.close;
+					reason = 'force';
+				}
+				if (exit == null) return true;
+				cash += exit * p.qty - fee(exit * p.qty);
+				shares -= p.qty;
+				closeT(p.px, exit, p.qty, 'long', p.day, i, reason);
+				signalClosedToday = true;
+
+				// H3：平回信号同时按同一触发价开反向新仓（一笔独立 1 万元操作）
+				if (cfg.signalReopen && reason === 'signal') {
+					const q = qtyOf(exit);
+					if (shares >= BASE_SHARES + q) {
+						cash += exit * q - fee(exit * q);
+						shares -= q;
+						const buyTrig = d.open * (1 - T);
+						if (d.low <= buyTrig) {
+							cash -= buyTrig * q + fee(buyTrig * q);
+							shares += q;
+							closeT(exit, buyTrig, q, 'short', i, i, 'signal');
+						} else {
+							reopenedSells.push({ px: exit, day: i, qty: q });
+						}
+					}
+				}
+				return false;
+			});
+			openSells.push(...reopenedSells);
+
+			const reopenedBuys = [];
+			openSells = openSells.filter((p) => {
+				let exit = null;
+				let reason = null;
+				const buyTrig = d.open * (1 - T);
+				if (d.low <= buyTrig) {
+					exit = buyTrig; // 空单平回只看相对当日开盘 −T
+					reason = 'signal';
+				} else if (i - p.day >= cfg.holdMaxDays) {
+					exit = d.close;
+					reason = 'force';
+				}
+				if (exit == null) return true;
+				cash -= exit * p.qty + fee(exit * p.qty);
+				shares += p.qty;
+				closeT(p.px, exit, p.qty, 'short', p.day, i, reason);
+				signalClosedToday = true;
+
+				if (cfg.signalReopen && reason === 'signal') {
+					const q = qtyOf(exit);
+					if (affordable(exit, q)) {
+						cash -= exit * q + fee(exit * q);
+						shares += q;
+						const sellTrig = d.open * (1 + T);
+						if (d.high >= sellTrig) {
+							cash += sellTrig * q - fee(sellTrig * q);
+							shares -= q;
+							closeT(exit, sellTrig, q, 'long', i, i, 'signal');
+						} else {
+							reopenedBuys.push({ px: exit, day: i, qty: q });
+						}
+					}
+				}
+				return false;
+			});
+			openBuys.push(...reopenedBuys);
+		} else {
+			openBuys = openBuys.filter((p) => {
+				let exit = null;
+				let reason = null;
+				if (d.low <= p.stop) {
+					exit = p.stop; // 保守：止损优先
+					reason = 'stop';
+				} else if (d.high >= p.target) {
+					exit = p.target;
+					reason = 'target';
+				} else if (i - p.day >= cfg.holdMaxDays) {
+					exit = d.close;
+					reason = 'force';
+				}
+				if (exit == null) return true;
+				cash += exit * p.qty - fee(exit * p.qty);
+				shares -= p.qty;
+				closeT(p.px, exit, p.qty, 'long', p.day, i, reason);
+				return false;
+			});
+			openSells = openSells.filter((p) => {
+				let exit = null;
+				let reason = null;
+				if (d.high >= p.stop) {
+					exit = p.stop;
+					reason = 'stop';
+				} else if (d.low <= p.target) {
+					exit = p.target;
+					reason = 'target';
+				} else if (i - p.day >= cfg.holdMaxDays) {
+					exit = d.close;
+					reason = 'force';
+				}
+				if (exit == null) return true;
+				cash -= exit * p.qty + fee(exit * p.qty);
+				shares += p.qty;
+				closeT(p.px, exit, p.qty, 'short', p.day, i, reason);
+				return false;
+			});
+		}
 
 		const openSellUnits = openSells.reduce((a, p) => a + p.qty, 0);
 
-		// 2) 区交易（低/高估区加减仓，带冷却）
+		// 2) 区交易（低/高估区加减仓，带冷却；平仓机制不影响本段）
 		if (sig.zoneBuy != null && i - lastZoneBuyDay >= cfg.zoneCooldown) {
 			const q = qtyOf(sig.zoneBuy);
 			if (affordable(sig.zoneBuy, q)) {
@@ -287,53 +412,88 @@ export function run(cfg, startIdx, days, models, endOverride = null, ampHist = n
 		}
 
 		// 3) 正常区做T（cfg.noT 仅用于收益分解诊断：禁止新开T单）
-		if (!cfg.noT && sig.t1) {
-			const q = qtyOf(sig.t1.buy);
-			if (affordable(sig.t1.buy, q)) {
-				cash -= sig.t1.buy * q + fee(sig.t1.buy * q);
-				shares += q;
-				if (sig.t1.sell != null) {
-					cash += sig.t1.sell * q - fee(sig.t1.sell * q);
+		if (!cfg.noT && cfg.tExit === 'signal' && !signalClosedToday) {
+			// 同一时间最多 1 笔过夜 T 单；先买信号优先，同日不再做第二次反向连锁
+			if (sig.t1 && openBuys.length === 0) {
+				const q = qtyOf(sig.t1.buy);
+				if (affordable(sig.t1.buy, q)) {
+					cash -= sig.t1.buy * q + fee(sig.t1.buy * q);
+					shares += q;
+					if (sig.t1.sell != null) {
+						cash += sig.t1.sell * q - fee(sig.t1.sell * q);
+						shares -= q;
+						closeT(sig.t1.buy, sig.t1.sell, q, 'long', i, i, 'sameDay');
+					} else if (openSells.length === 0) {
+						openBuys.push({ px: sig.t1.buy, day: i, qty: q });
+					} else {
+						cash += sig.t1.buy * q - fee(sig.t1.buy * q);
+						shares -= q;
+					}
+				}
+			} else if (sig.t2 && openSells.length === 0) {
+				const q = qtyOf(sig.t2.sell);
+				if (shares - openSellUnits >= BASE_SHARES + q) {
+					cash += sig.t2.sell * q - fee(sig.t2.sell * q);
 					shares -= q;
-					closeT(sig.t1.buy, sig.t1.sell, q);
-				} else if (cfg.tExit === 'sameDay') {
-					cash += d.close * q - fee(d.close * q);
-					shares -= q;
-					closeT(sig.t1.buy, d.close, q);
-					tFailClose++;
-				} else {
-					openBuys.push({
-						px: sig.t1.buy,
-						day: i,
-						qty: q,
-						target: sig.t1.buy * (1 + T * cfg.holdTargetK),
-						stop: sig.t1.buy * (1 - T * cfg.holdStopK)
-					});
+					if (sig.t2.buy != null) {
+						cash -= sig.t2.buy * q + fee(sig.t2.buy * q);
+						shares += q;
+						closeT(sig.t2.sell, sig.t2.buy, q, 'short', i, i, 'sameDay');
+					} else if (openBuys.length === 0) {
+						openSells.push({ px: sig.t2.sell, day: i, qty: q });
+					} else {
+						cash -= sig.t2.sell * q + fee(sig.t2.sell * q);
+						shares += q;
+					}
 				}
 			}
-		}
-		if (!cfg.noT && sig.t2) {
-			const q = qtyOf(sig.t2.sell);
-			if (shares - openSellUnits >= BASE_SHARES + q) {
-				cash += sig.t2.sell * q - fee(sig.t2.sell * q);
-				shares -= q;
-				if (sig.t2.buy != null) {
-					cash -= sig.t2.buy * q + fee(sig.t2.buy * q);
+		} else {
+			if (!cfg.noT && sig.t1) {
+				const q = qtyOf(sig.t1.buy);
+				if (affordable(sig.t1.buy, q)) {
+					cash -= sig.t1.buy * q + fee(sig.t1.buy * q);
 					shares += q;
-					closeT(sig.t2.sell, sig.t2.buy, q);
-				} else if (cfg.tExit === 'sameDay') {
-					cash -= d.close * q + fee(d.close * q);
-					shares += q;
-					closeT(sig.t2.sell, d.close, q);
-					tFailClose++;
-				} else {
-					openSells.push({
-						px: sig.t2.sell,
-						day: i,
-						qty: q,
-						target: sig.t2.sell * (1 - T * cfg.holdTargetK),
-						stop: sig.t2.sell * (1 + T * cfg.holdStopK)
-					});
+					if (sig.t1.sell != null) {
+						cash += sig.t1.sell * q - fee(sig.t1.sell * q);
+						shares -= q;
+						closeT(sig.t1.buy, sig.t1.sell, q, 'long', i, i, 'sameDay');
+					} else if (cfg.tExit === 'sameDay') {
+						cash += d.close * q - fee(d.close * q);
+						shares -= q;
+						closeT(sig.t1.buy, d.close, q, 'long', i, i, 'sameDay');
+					} else {
+						openBuys.push({
+							px: sig.t1.buy,
+							day: i,
+							qty: q,
+							target: sig.t1.buy * (1 + T * cfg.holdTargetK),
+							stop: sig.t1.buy * (1 - T * cfg.holdStopK)
+						});
+					}
+				}
+			}
+			if (!cfg.noT && sig.t2) {
+				const q = qtyOf(sig.t2.sell);
+				if (shares - openSellUnits >= BASE_SHARES + q) {
+					cash += sig.t2.sell * q - fee(sig.t2.sell * q);
+					shares -= q;
+					if (sig.t2.buy != null) {
+						cash -= sig.t2.buy * q + fee(sig.t2.buy * q);
+						shares += q;
+						closeT(sig.t2.sell, sig.t2.buy, q, 'short', i, i, 'sameDay');
+					} else if (cfg.tExit === 'sameDay') {
+						cash -= d.close * q + fee(d.close * q);
+						shares += q;
+						closeT(sig.t2.sell, d.close, q, 'short', i, i, 'sameDay');
+					} else {
+						openSells.push({
+							px: sig.t2.sell,
+							day: i,
+							qty: q,
+							target: sig.t2.sell * (1 - T * cfg.holdTargetK),
+							stop: sig.t2.sell * (1 + T * cfg.holdStopK)
+						});
+					}
 				}
 			}
 		}
@@ -344,13 +504,13 @@ export function run(cfg, startIdx, days, models, endOverride = null, ampHist = n
 		const c = days[endIdx].close;
 		cash += c * p.qty - fee(c * p.qty);
 		shares -= p.qty;
-		closeT(p.px, c, p.qty);
+		closeT(p.px, c, p.qty, 'long', p.day, endIdx, 'end');
 	}
 	for (const p of openSells) {
 		const c = days[endIdx].close;
 		cash -= c * p.qty + fee(c * p.qty);
 		shares += p.qty;
-		closeT(p.px, c, p.qty);
+		closeT(p.px, c, p.qty, 'short', p.day, endIdx, 'end');
 	}
 
 	return {
@@ -362,6 +522,11 @@ export function run(cfg, startIdx, days, models, endOverride = null, ampHist = n
 			tWinRate: tCount ? tWin / tCount : 0,
 			tProfit,
 			tFailClose,
+			tForceClose,
+			tHoldDays,
+			tMaxLoss,
+			tExitCounts,
+			trades,
 			zoneBuyCount,
 			zoneSellCount
 		}
